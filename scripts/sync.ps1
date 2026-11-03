@@ -11,8 +11,11 @@
   The first run creates everything. Later runs reuse the existing space, tab,
   core terminal and TUI tab, so it is safe to run after a restart.
 
+  The TUI side is sent over stdin (`hc exec -i ... bash -s --`), so no
+  predictable temporary file is written on the remote machine.
+
 .PARAMETER Machine
-  Machine name from `hc machine ls`. Required.
+  Machine name from `hc machine ls`. Required unless -Config/-All is used.
 
 .PARAMETER SpaceName
   Desktop space name. Default: agents.
@@ -33,7 +36,11 @@
   Absolute path to herdr on the remote, if it is not on PATH.
 
 .PARAMETER ReplaceTuiTab
-  If a TUI tab with the label exists but is not attached, close and recreate it.
+  Close and recreate TUI tabs with the label that are not attached.
+
+.PARAMETER Restart
+  Recreate a live desktop tab even when the agent cannot be confirmed. This can
+  end a running agent session.
 
 .PARAMETER SelectDesktop
   Select the desktop space when done.
@@ -41,180 +48,321 @@
 .PARAMETER SkipVerify
   Skip the screen-content comparison.
 
+.PARAMETER Observe
+  Attach in read-only observe mode.
+
+.PARAMETER Focus
+  Focus the TUI tab after attaching.
+
+.PARAMETER Config
+  Path to a sync.json file with defaults and targets.
+
+.PARAMETER Target
+  With -Config, run only the target with this name.
+
+.PARAMETER All
+  Run every target in ./sync.json.
+
+.PARAMETER DryRun
+  Show what would happen without changing anything.
+
+.PARAMETER Json
+  Emit one JSON object per target.
+
 .EXAMPLE
   pwsh -File scripts/sync.ps1 -Machine my-vps -SpaceName agents -TabName codex
 
 .EXAMPLE
   pwsh -File scripts/sync.ps1 -Machine my-vps -AgentArgv "claude"
+
+.EXAMPLE
+  pwsh -File scripts/sync.ps1 -All -Config ./sync.json
 #>
 [CmdletBinding()]
 param(
-  [string]$Machine = "",
-  [string]$SpaceName = "agents",
-  [string]$TabName = "codex",
-  [string]$AgentArgv = "codex --no-daemon",
-  [string]$Folder = "",
-  [string]$RemoteHc = "",
-  [string]$RemoteHerdr = "",
-  [switch]$ReplaceTuiTab,
-  [switch]$SelectDesktop,
-  [switch]$SkipVerify
+    [string]$Machine = '',
+    [string]$SpaceName = 'agents',
+    [string]$TabName = 'codex',
+    [string]$AgentArgv = 'codex --no-daemon',
+    [string]$Folder = '',
+    [string]$RemoteHc = '',
+    [string]$RemoteHerdr = '',
+    [switch]$ReplaceTuiTab,
+    [switch]$Restart,
+    [switch]$SelectDesktop,
+    [switch]$SkipVerify,
+    [switch]$Observe,
+    [switch]$Focus,
+    [string]$Config = '',
+    [string]$Target = '',
+    [switch]$All,
+    [switch]$DryRun,
+    [switch]$Json
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot 'lib/herdr-sync.psm1') -Force
 
-function ConvertTo-ShQuote {
-  param([string]$Value)
-  if ($Value -match '^[A-Za-z0-9_./:@%+=,-]+$') { return $Value }
-  return "'" + ($Value -replace "'", "'\''") + "'"
+function Get-ConfigValue {
+    param($Object, [string]$Name, $Default)
+
+    if ($null -eq $Object) {
+        return $Default
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property -or $null -eq $property.Value) {
+        return $Default
+    }
+    return $property.Value
 }
 
-function Get-ScreenLines {
-  param([string]$Text)
-  return @(
-    $Text -split "\r?\n" |
-      ForEach-Object { $_.Trim() } |
-      Where-Object { $_.Length -ge 3 } |
-      Select-Object -Unique
-  )
+function Get-SyncTargets {
+    if (-not ($All -or $Config)) {
+        if (-not $Machine) {
+            throw 'Pass -Machine with a name from `hc machine ls`, or -All/-Config with a sync.json file.'
+        }
+        return @([pscustomobject]@{
+            Name         = $TabName
+            Machine      = $Machine
+            SpaceName    = $SpaceName
+            TabName      = $TabName
+            AgentArgv    = $AgentArgv
+            Folder       = $Folder
+            RemoteHc     = $RemoteHc
+            RemoteHerdr  = $RemoteHerdr
+            ReplaceTui   = [bool]$ReplaceTuiTab
+            Restart      = [bool]$Restart
+            Observe      = [bool]$Observe
+            Focus        = [bool]$Focus
+            SkipVerify   = [bool]$SkipVerify
+        })
+    }
+
+    $configPath = $Config
+    if (-not $configPath) {
+        $configPath = Join-Path (Get-Location) 'sync.json'
+    }
+    if (-not (Test-Path -LiteralPath $configPath)) {
+        throw "config file not found: $configPath (create sync.json or pass -Config)"
+    }
+
+    $document = (Get-Content -Raw -LiteralPath $configPath) | ConvertFrom-Json
+    $defaults = Get-ConfigValue -Object $document -Name 'defaults' -Default $null
+
+    $items = @()
+    if ($null -ne $document.PSObject.Properties['targets']) {
+        $items = @($document.targets)
+    } elseif ($document -is [System.Array]) {
+        $items = @($document)
+    }
+
+    if ($items.Count -eq 0) {
+        throw "config file has no targets: $configPath"
+    }
+
+    $targets = foreach ($item in $items) {
+        [pscustomobject]@{
+            Name        = [string](Get-ConfigValue -Object $item -Name 'name' -Default "$(Get-ConfigValue -Object $item -Name 'tab' -Default '')@$(Get-ConfigValue -Object $item -Name 'machine' -Default '')")
+            Machine     = [string](Get-ConfigValue -Object $item -Name 'machine' -Default '')
+            SpaceName   = [string](Get-ConfigValue -Object $item -Name 'space' -Default (Get-ConfigValue -Object $defaults -Name 'space' -Default 'agents'))
+            TabName     = [string](Get-ConfigValue -Object $item -Name 'tab' -Default 'codex')
+            AgentArgv   = [string](Get-ConfigValue -Object $item -Name 'argv' -Default (Get-ConfigValue -Object $defaults -Name 'argv' -Default 'codex --no-daemon'))
+            Folder      = [string](Get-ConfigValue -Object $item -Name 'folder' -Default (Get-ConfigValue -Object $defaults -Name 'folder' -Default ''))
+            RemoteHc    = [string](Get-ConfigValue -Object $item -Name 'remoteHc' -Default (Get-ConfigValue -Object $defaults -Name 'remoteHc' -Default ''))
+            RemoteHerdr = [string](Get-ConfigValue -Object $item -Name 'remoteHerdr' -Default (Get-ConfigValue -Object $defaults -Name 'remoteHerdr' -Default ''))
+            ReplaceTui  = [bool]$ReplaceTuiTab -or [bool](Get-ConfigValue -Object $item -Name 'replaceTui' -Default (Get-ConfigValue -Object $defaults -Name 'replaceTui' -Default $false))
+            Restart     = [bool]$Restart -or [bool](Get-ConfigValue -Object $item -Name 'restart' -Default (Get-ConfigValue -Object $defaults -Name 'restart' -Default $false))
+            Observe     = [bool]$Observe -or [bool](Get-ConfigValue -Object $item -Name 'observe' -Default (Get-ConfigValue -Object $defaults -Name 'observe' -Default $false))
+            Focus       = [bool]$Focus -or [bool](Get-ConfigValue -Object $item -Name 'focus' -Default (Get-ConfigValue -Object $defaults -Name 'focus' -Default $false))
+            SkipVerify  = [bool]$SkipVerify -or [bool](Get-ConfigValue -Object $item -Name 'skipVerify' -Default (Get-ConfigValue -Object $defaults -Name 'skipVerify' -Default $false))
+        }
+    }
+
+    if ($Target) {
+        $selected = @($targets | Where-Object { $_.Name -eq $Target -or $_.TabName -eq $Target })
+        if ($selected.Count -eq 0) {
+            throw "target '$Target' not found in $configPath (available: $((@($targets | ForEach-Object { $_.Name })) -join ', '))"
+        }
+        return @($selected[0])
+    }
+
+    return @($targets)
 }
 
-foreach ($binary in @("herdr-app", "hc")) {
-  if (-not (Get-Command $binary -ErrorAction SilentlyContinue)) {
-    throw "$binary was not found in PATH"
-  }
+function Invoke-SyncTarget {
+    param($Target)
+
+    if (-not $Target.Machine) {
+        throw 'target has no machine'
+    }
+    if (-not $Target.TabName) {
+        throw 'target has no tab name'
+    }
+
+    $setupScript = Join-Path $PSScriptRoot 'setup-desktop.ps1'
+    $attachScript = Join-Path $PSScriptRoot 'attach-tui.sh'
+
+    $setupArguments = @{
+        Machine   = $Target.Machine
+        SpaceName = $Target.SpaceName
+        TabName   = $Target.TabName
+        AgentArgv = $Target.AgentArgv
+        Json      = $true
+    }
+    if ($Target.Folder) { $setupArguments['Folder'] = $Target.Folder }
+    if ($Target.Restart) { $setupArguments['Replace'] = $true }
+    if ($SelectDesktop) { $setupArguments['SelectDesktop'] = $true }
+    if ($DryRun) { $setupArguments['DryRun'] = $true }
+
+    $setupOutput = & $setupScript @setupArguments
+    try {
+        $desktop = ($setupOutput | Out-String).Trim() | ConvertFrom-Json
+    } catch {
+        throw "setup-desktop.ps1 returned invalid JSON: $($setupOutput | Out-String)"
+    }
+
+    if ($DryRun) {
+        return [pscustomobject]@{
+            name             = $Target.Name
+            machine          = $Target.Machine
+            ok               = $true
+            dry_run          = $true
+            desktop_action   = [string]$desktop.action
+            space            = [string]$desktop.space
+            tab              = [string]$desktop.tab
+            terminal         = [string]$desktop.terminal
+            local_terminal   = [string]$desktop.local_terminal
+            tui_tab          = $null
+            tui_pane         = $null
+            tui_reused       = $false
+            tui_replaced     = 0
+            observe          = [bool]$Target.Observe
+            focused          = $false
+            shared_line      = $null
+            verified         = $false
+            error            = $null
+        }
+    }
+
+    $attachArguments = @($desktop.local_terminal, $Target.TabName, '--json')
+    if ($Target.ReplaceTui) { $attachArguments += '--replace' }
+    if ($Target.Observe) { $attachArguments += '--observe' }
+    if ($Target.Focus) { $attachArguments += '--focus' }
+    if ($Target.RemoteHc) { $attachArguments += @('--hc', $Target.RemoteHc) }
+    if ($Target.RemoteHerdr) { $attachArguments += @('--herdr', $Target.RemoteHerdr) }
+
+    $quotedArguments = ($attachArguments | ForEach-Object { ConvertTo-ShSingleQuoted -Value $_ }) -join ' '
+    # Strip CR on the remote: Windows PowerShell appends CRLF to piped stdin.
+    $remoteCommand = "tr -d '\r' | bash -s -- $quotedArguments"
+
+    # Send the script over stdin: no predictable /tmp path, no second copy step.
+    $scriptText = (Get-Content -Raw -LiteralPath $attachScript) -replace "`r`n", "`n"
+    if (-not $scriptText.EndsWith("`n")) {
+        $scriptText += "`n"
+    }
+
+    $output = $scriptText | & hc exec -i --on $Target.Machine $remoteCommand 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "attach-tui.sh failed on $($Target.Machine) (exit $LASTEXITCODE):`n$($output | Out-String)"
+    }
+    $attach = ConvertFrom-AttachOutput -Text ($output | Out-String)
+
+    $core = Get-CoreTerminal -Address $desktop.terminal
+    if (-not $core -or $core.state -ne 'live') {
+        throw "herdr-core terminal $($desktop.terminal) is not live"
+    }
+
+    $sharedLine = $null
+    if (-not $Target.SkipVerify) {
+        $desktopText = (& hc read $desktop.terminal --lines 200 2>&1 | Out-String)
+        $readCommand = "$(ConvertTo-ShSingleQuoted -Value $attach.Herdr) pane read $(ConvertTo-ShSingleQuoted -Value $attach.Pane) --source recent --lines 200"
+        $tuiText = (& hc exec --on $Target.Machine $readCommand 2>&1 | Out-String)
+        $sharedLine = Get-SharedScreenLine -Left (Get-ScreenLines -Text $desktopText) -Right (Get-ScreenLines -Text $tuiText)
+    }
+
+    return [pscustomobject]@{
+        name             = $Target.Name
+        machine          = $Target.Machine
+        ok               = $true
+        dry_run          = $false
+        desktop_action   = [string]$desktop.action
+        space            = [string]$desktop.space
+        tab              = [string]$desktop.tab
+        terminal         = [string]$desktop.terminal
+        local_terminal   = [string]$desktop.local_terminal
+        state            = [string]$core.state
+        agent            = [string]$desktop.agent
+        status           = [string]$desktop.status
+        tui_tab          = [string]$attach.Tab
+        tui_pane         = [string]$attach.Pane
+        tui_reused       = [bool]$attach.Reused
+        tui_replaced     = [int]$attach.Replaced
+        observe          = [bool]$attach.Observed
+        focused          = [bool]$attach.Focused
+        shared_line      = $sharedLine
+        verified         = [bool]$sharedLine
+        error            = $null
+    }
 }
 
-if (-not $Machine) {
-  throw "Pass -Machine with a name from ``hc machine ls``."
+$targets = @(Get-SyncTargets)
+$results = [System.Collections.Generic.List[object]]::new()
+$failures = [System.Collections.Generic.List[string]]::new()
+
+foreach ($syncTarget in $targets) {
+    try {
+        $result = Invoke-SyncTarget -Target $syncTarget
+        $results.Add($result)
+    } catch {
+        $message = $_.Exception.Message
+        $failures.Add("$($syncTarget.Name): $message")
+        $results.Add([pscustomobject]@{
+            name     = $syncTarget.Name
+            machine  = $syncTarget.Machine
+            ok       = $false
+            dry_run  = [bool]$DryRun
+            error    = $message
+        })
+        Write-Error -Message "[$( $syncTarget.Name )] $message" -ErrorAction Continue
+    }
 }
 
-$setupScript = Join-Path $PSScriptRoot "setup-desktop.ps1"
-$attachScript = Join-Path $PSScriptRoot "attach-tui.sh"
-
-if (-not (Test-Path -LiteralPath $setupScript)) {
-  throw "missing $setupScript"
-}
-if (-not (Test-Path -LiteralPath $attachScript)) {
-  throw "missing $attachScript"
-}
-
-# --- Desktop side ---------------------------------------------------------
-
-$setupArgs = @{
-  Machine   = $Machine
-  SpaceName = $SpaceName
-  TabName   = $TabName
-  AgentArgv = $AgentArgv
-  Folder    = $Folder
-  Json      = $true
-}
-if ($SelectDesktop) {
-  $setupArgs["SelectDesktop"] = $true
-}
-
-$desktop = (& $setupScript @setupArgs) | ConvertFrom-Json
-
-# --- TUI side -------------------------------------------------------------
-
-$remoteScript = "/tmp/herdr-sync-attach-$PID.sh"
-$scriptText = (Get-Content -Raw -LiteralPath $attachScript) -replace "`r`n", "`n"
-if (-not $scriptText.EndsWith("`n")) {
-  $scriptText += "`n"
-}
-
-$writeOutput = $scriptText | hc file write --on $Machine $remoteScript 2>&1
-if ($LASTEXITCODE -ne 0) {
-  throw "could not copy attach-tui.sh to ${Machine}: $($writeOutput | Out-String)"
-}
-
-# Windows PowerShell can append CRLF to the piped content. Strip CR so bash
-# does not try to execute a trailing carriage return as a command.
-$stripCr = "tr -d '\015' < $(ConvertTo-ShQuote $remoteScript) > $(ConvertTo-ShQuote "$remoteScript.tmp") && mv $(ConvertTo-ShQuote "$remoteScript.tmp") $(ConvertTo-ShQuote $remoteScript)"
-hc exec --on $Machine $stripCr 2>&1 | Out-Null
-
-$remoteCommand = "bash $(ConvertTo-ShQuote $remoteScript) $(ConvertTo-ShQuote $desktop.local_terminal) $(ConvertTo-ShQuote $TabName)"
-if ($ReplaceTuiTab) {
-  $remoteCommand += " --replace"
-}
-if ($RemoteHc) {
-  $remoteCommand += " --hc $(ConvertTo-ShQuote $RemoteHc)"
-}
-if ($RemoteHerdr) {
-  $remoteCommand += " --herdr $(ConvertTo-ShQuote $RemoteHerdr)"
-}
-
-$attachOutput = @()
-try {
-  $attachOutput = @(hc exec --on $Machine $remoteCommand 2>&1)
-  if ($LASTEXITCODE -ne 0) {
-    throw "attach-tui.sh failed on ${Machine}:`n$($attachOutput -join "`n")"
-  }
-} finally {
-  hc exec --on $Machine "rm -f $(ConvertTo-ShQuote $remoteScript)" 2>&1 | Out-Null
-}
-
-$attach = @{}
-foreach ($line in (($attachOutput | Out-String) -split "\r?\n")) {
-  if ($line -match '^([A-Z_]+)=(.*)$') {
-    $attach[$matches[1]] = $matches[2].Trim()
-  }
-}
-
-foreach ($key in @("TAB", "PANE", "HC", "HERDR", "REUSED")) {
-  if (-not $attach.ContainsKey($key)) {
-    throw "could not parse attach-tui.sh output:`n$($attachOutput -join "`n")"
-  }
-}
-
-# --- Verify ---------------------------------------------------------------
-
-$core = ((hc get $desktop.terminal --json 2>&1 | Out-String).Trim()) | ConvertFrom-Json
-if ($core.state -ne "live") {
-  throw "herdr-core terminal $($desktop.terminal) is not live (state=$($core.state))"
-}
-
-$sharedLine = $null
-if (-not $SkipVerify) {
-  $desktopText = (hc read $desktop.terminal --lines 200 2>&1 | Out-String)
-  $tuiReadCommand = "$(ConvertTo-ShQuote $attach['HERDR']) pane read $(ConvertTo-ShQuote $attach['PANE']) --source recent --lines 200"
-  $tuiText = (hc exec --on $Machine $tuiReadCommand 2>&1 | Out-String)
-
-  $desktopLines = @(Get-ScreenLines $desktopText)
-  $tuiLines = @(Get-ScreenLines $tuiText)
-
-  $sharedLine = Compare-Object `
-    -ReferenceObject $desktopLines `
-    -DifferenceObject $tuiLines `
-    -IncludeEqual `
-    -ExcludeDifferent |
-    ForEach-Object { $_.InputObject } |
-    Sort-Object Length -Descending |
-    Select-Object -First 1
-}
-
-# --- Report ---------------------------------------------------------------
-
-Write-Host ""
-Write-Host "Herdr desktop"
-Write-Host "  space    : $SpaceName"
-Write-Host "  tab      : $TabName"
-Write-Host "  space id : $($desktop.space)"
-Write-Host "  tab id   : $($desktop.tab)"
-Write-Host "  terminal : $($desktop.terminal) (state=$($core.state), agent=$($desktop.agent), status=$($desktop.status))"
-Write-Host ""
-Write-Host "Herdr TUI"
-Write-Host "  tab      : $($attach['TAB'])"
-Write-Host "  pane     : $($attach['PANE'])"
-Write-Host "  attach   : $($attach['HC']) attach $($desktop.local_terminal)"
-Write-Host "  reused   : $($attach['REUSED'])"
-Write-Host ""
-
-if ($SkipVerify) {
-  Write-Host "Shared content: verification skipped."
-} elseif ($sharedLine) {
-  Write-Host "Shared content: yes (matched line: $sharedLine)"
+if ($Json) {
+    @($results) | ConvertTo-Json -Depth 6
 } else {
-  Write-Host "Shared content: attach is confirmed, but no identical rendered line was found."
-  Write-Host "This can happen when the two panes have very different widths."
+    $index = 0
+    foreach ($result in $results) {
+        $index++
+        Write-Host ''
+        Write-Host "[$index/$($targets.Count)] $($result.name)"
+        if (-not $result.ok) {
+            Write-Host "  failed   : $($result.error)"
+            continue
+        }
+        if ($result.dry_run) {
+            Write-Host "  desktop  : $($result.desktop_action) (space=$($result.space), tab=$($result.tab))"
+            Write-Host "  tui      : would attach $($result.local_terminal)"
+            continue
+        }
+        Write-Host "  space    : $($result.space)"
+        Write-Host "  tab      : $($result.tab) ($($result.desktop_action))"
+        Write-Host "  terminal : $($result.terminal) (state=$($result.state), agent=$($result.agent), status=$($result.status))"
+        Write-Host "  tui      : tab $($result.tui_tab), pane $($result.tui_pane), reused=$($result.tui_reused), observe=$($result.observe), focused=$($result.focused)"
+        if ($result.verified) {
+            Write-Host "  shared   : yes ($($result.shared_line))"
+        } elseif ($SkipVerify) {
+            Write-Host '  shared   : verification skipped.'
+        } else {
+            Write-Host '  shared   : attach confirmed, but no identical rendered line was found (very different pane widths).'
+        }
+    }
+}
+
+if ($failures.Count -gt 0) {
+    Write-Host ''
+    Write-Host "$($failures.Count) target(s) failed:"
+    foreach ($failure in $failures) {
+        Write-Host "  - $failure"
+    }
+    exit 1
 }

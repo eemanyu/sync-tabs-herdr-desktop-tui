@@ -1,0 +1,25 @@
+{
+  "defaults": {
+    "space": "agents",
+    "argv": "codex --no-daemon",
+    "folder": "",
+    "replaceTui": false,
+    "restart": false,
+    "observe": false,
+    "focus": false,
+    "skipVerify": false
+  },
+  "targets": [
+    {
+      "name": "codex",
+      "machine": "my-vps",
+      "tab": "codex"
+    },
+    {
+      "name": "claude",
+      "machine": "my-vps",
+      "tab": "claude",
+      "argv": "claude"
+    }
+  ]
+}

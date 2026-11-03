@@ -39,6 +39,8 @@ This is why the TUI tab must run `hc attach`, not the agent directly. Two indepe
 - **PowerShell 7+** on the desktop for the `.ps1` scripts.
 - The agent must stay in the foreground. For Codex that means `codex --no-daemon`; otherwise Codex hands the turn to its background app-server and herdr-core cannot see the agent status.
 
+Verified on 2026-11-02 with **herdr 0.9.5**, **hc 0.1.17** and **herdr-app 0.1.12** (Windows 11 desktop driving an Ubuntu 24.04 arm64 VPS). `hc attach --observe`, `herdr tab focus`, `herdr pane run`, `space.new`, `tab.new`, `tab.close --confirmed true` and `space.select --id` all exist in those versions. Older releases may not.
+
 ## Quick start
 
 ```powershell
@@ -69,21 +71,65 @@ pwsh -File scripts/sync.ps1 `
   -AgentArgv "codex --no-daemon" `
   -Folder /path/to/project `
   -ReplaceTuiTab `
-  -SelectDesktop
+  -Focus
 ```
 
 | Option | Meaning |
 | --- | --- |
-| `-Machine` | Machine name from `hc machine ls` (required). |
+| `-Machine` | Machine name from `hc machine ls` (required unless `-Config`/`-All`). |
 | `-SpaceName` | Desktop space name. Default: `agents`. |
 | `-TabName` | Desktop tab name, also used for the TUI tab label. Default: `codex`. |
 | `-AgentArgv` | Agent command and arguments. Default: `codex --no-daemon`. |
 | `-Folder` | Starting folder on the remote machine. Default: the machine's home. |
 | `-RemoteHc` | Absolute path to `hc` on the remote, if it is not on `PATH`. |
 | `-RemoteHerdr` | Absolute path to `herdr` on the remote, if it is not on `PATH`. |
-| `-ReplaceTuiTab` | If a TUI tab with the label exists but is not attached, close and recreate it. |
-| `-SelectDesktop` | Select the space in the desktop app when done. |
+| `-ReplaceTuiTab` | Close and recreate same-label TUI tabs that are not attached. |
+| `-Restart` | Recreate a live desktop tab even when the agent cannot be confirmed. **This can end a running session.** |
+| `-Observe` | Attach in read-only mode (`hc attach --observe`). |
+| `-Focus` | Focus the TUI tab after attaching. |
+| `-SelectDesktop` | Select the desktop space when done. |
 | `-SkipVerify` | Skip the screen-content comparison. |
+| `-Config` | Path to a `sync.json` with defaults and targets. |
+| `-Target` | With `-Config`, run only the target with this name. |
+| `-All` | Run every target in `./sync.json`. |
+| `-DryRun` | Show what would happen without changing anything. |
+| `-Json` | Emit JSON (one object per target). |
+
+## Several agents at once
+
+`-All` reads `sync.json` from the current directory (or use `-Config path`):
+
+```json
+{
+  "defaults": {
+    "space": "agents",
+    "argv": "codex --no-daemon",
+    "focus": true
+  },
+  "targets": [
+    { "name": "codex", "machine": "my-vps", "tab": "codex" },
+    { "name": "claude", "machine": "my-vps", "tab": "claude", "argv": "claude" },
+    {
+      "name": "reviewer",
+      "machine": "my-vps",
+      "tab": "reviewer",
+      "argv": "codex --no-daemon --model gpt-5",
+      "folder": "/srv/app",
+      "observe": true
+    }
+  ]
+}
+```
+
+```powershell
+Copy-Item sync.example.json sync.json
+pwsh -File scripts/sync.ps1 -All
+pwsh -File scripts/sync.ps1 -All -Target claude
+```
+
+Targets inherit `defaults` and override any key. Run one target with `-Target`.
+Each target is attempted even if a previous one fails; the exit code is `1` if
+any target failed. `-DryRun -All` is a safe way to check a config.
 
 ## Manual setup
 
@@ -118,6 +164,12 @@ herdr tab create --label codex --no-focus
 # => {"result":{"root_pane":{"pane_id":"w1:p16"},"tab":{"tab_id":"w1:t16"}},...}
 
 herdr pane run w1:p16 'hc attach t1'
+
+# Optional: focus the new tab with the real command.
+herdr tab focus w1:t16
+
+# Read-only instead of an interactive attach:
+herdr pane run w1:p16 'hc attach --observe t1'
 ```
 
 Use the **local** address (`t1`), not `my-vps/t1`, because `hc attach` runs on the same machine as the core terminal.
@@ -129,7 +181,7 @@ hc get t1 --json
 # state: live, status: idle, foreground: codex
 
 herdr pane process-info --pane w1:p16
-# foreground_processes[0].cmdline: "hc attach t1"
+# foreground_processes[0].argv: ["/usr/local/bin/hc","attach","t1"]
 ```
 
 Type in either window. Both should show the same draft and the same responses.
@@ -139,14 +191,22 @@ Type in either window. Both should show the same draft and the same responses.
 ```
 .
 ├── README.md
+├── CHANGELOG.md
 ├── LICENSE
-├── .gitignore
+├── PSScriptAnalyzerSettings.psd1
+├── sync.example.json
+├── .github/workflows/ci.yml
 ├── docs/
 │   └── how-it-works.md
-└── scripts/
-    ├── setup-desktop.ps1   # create/reuse the desktop space, tab and core terminal
-    ├── attach-tui.sh       # run on the remote: create the TUI tab and hc attach
-    └── sync.ps1            # orchestrate both sides and verify
+├── scripts/
+│   ├── lib/herdr-sync.psm1  # shared parsing/quoting/verification helpers
+│   ├── setup-desktop.ps1    # create/reuse the desktop space, tab and core terminal
+│   ├── attach-tui.sh        # run on the remote: create the TUI tab and hc attach
+│   └── sync.ps1             # orchestrate both sides and verify
+└── tests/
+    ├── attach-tui.test.sh   # mock-driven shell tests
+    ├── mocks/               # fake herdr and hc
+    └── ps/                  # Pester tests for the PowerShell module
 ```
 
 ## Scripts
@@ -156,12 +216,26 @@ Type in either window. Both should show the same draft and the same responses.
 Creates or reuses the desktop space/tab and the herdr-core terminal.
 
 - Idempotent: finds the space by `machine` + `name`, then the tab by `name`.
-- If the tab exists but its terminal is no longer live, or the terminal is live but the requested agent is not running in it, the tab is recreated.
-- Waits up to 30 seconds for the core terminal to become live.
-- Prints a JSON object with `-Json` (used by `sync.ps1`), otherwise a human-readable summary.
+- Reuses a live terminal when the agent is reported by OSC 7501 or matches the
+  foreground name/argv.
+- Restarts the agent only when the terminal is sitting at a shell prompt (the
+  agent exited) or when `-Replace` is passed.
+- Warns and keeps a live terminal with an unrecognized foreground process
+  (wrappers such as `npx`, `uv run` or `node script.js`), because recreating it
+  would kill a session that may still be healthy.
+- Sees duplicate tab names: reuses the first live/attached one, closes stale
+  duplicates only when replacing, and creates the replacement **before** closing
+  the old tab (closing the only tab of a space closes the space).
+- Waits up to 30 seconds for the core terminal to become live and 20 seconds for
+  the agent to report in; an agent that never reports is a warning, not an
+  error.
+- Prints a JSON object with `-Json`, otherwise a human-readable summary.
+- `-DryRun` reports what would happen without changing anything.
+- `-NoReplace` refuses to close or recreate an existing tab.
 
 ```powershell
 pwsh -File scripts/setup-desktop.ps1 -Machine my-vps -SpaceName agents -TabName codex -Json
+pwsh -File scripts/setup-desktop.ps1 -Machine my-vps -DryRun
 ```
 
 ### `scripts/attach-tui.sh`
@@ -172,43 +246,72 @@ Runs **on the machine that hosts the TUI**. Creates a tab and attaches it to a c
 ./attach-tui.sh t1 codex
 # TAB=w1:t16
 # PANE=w1:p16
+# TERMINAL=t1
+# LABEL=codex
+# HC=/home/ubuntu/.local/bin/hc
+# HERDR=/home/ubuntu/.local/bin/herdr
 # ATTACHED=yes
 # REUSED=no
+# REPLACED=0
+# OBSERVE=no
+# FOCUSED=no
 ```
 
-- Reuses an existing tab if its foreground process is already `hc attach <terminal>`.
-- With `--replace`, recreates a stale tab that has the right label but is not attached.
-- Resolves `hc` and `herdr` from `PATH`, then `~/.local/bin`.
+- Reuses an existing tab when its foreground process is `hc attach <terminal>`
+  (also with `--observe`), detected from the process `argv` array.
+- With `--replace`, recreates same-label tabs that are not attached, and closes
+  stale duplicates even when a healthy tab exists.
+- Resolves `hc` and `herdr` from `PATH`, then `~/.local/bin`. Override with
+  `--hc` / `--herdr`.
+- `--observe` attaches read-only; `--focus` focuses the tab at the end.
 - `--json` emits one JSON object.
+- Exit codes: `0` attached, `1` command failure, `2` usage error, `3` a
+  same-label tab exists but is not attached (pass `--replace`).
 
 ### `scripts/sync.ps1`
 
-The one-command entry point. Calls `setup-desktop.ps1`, copies `attach-tui.sh` to `/tmp` on the remote, runs it with `hc exec`, then checks the result.
+The one-command entry point. Calls `setup-desktop.ps1`, streams `attach-tui.sh`
+to the remote over stdin (`hc exec -i ... 'tr -d "\r" | bash -s -- ...'`), then
+checks the result. No predictable `/tmp` file is written on the remote.
 
 The verification is intentionally conservative:
 
 - `hc get <terminal> --json` must report `state: live`.
-- The TUI pane's foreground process must be `hc attach <terminal>`.
-- The desktop and TUI screens must share at least one non-trivial line. Rendering widths differ, so a full byte-for-byte screen comparison would be misleading.
+- The TUI pane's foreground process must be `hc attach <terminal>` (or
+  `hc attach --observe <terminal>`); this is checked from the `argv` array.
+- The desktop and TUI screens must share at least one normalized line. Rendering
+  widths differ, so a full byte-for-byte screen comparison would be misleading;
+  the shared line is reported, and "no identical line" is reported as such
+  instead of being called a success.
 
-## How the pieces fit
+`-DryRun` prints the same plan without creating anything.
 
-See [docs/how-it-works.md](docs/how-it-works.md) for the longer version.
+## Safety notes
 
-- **One owner.** herdr-core owns the PTY. The desktop app and the TUI are both clients.
-- **One agent.** The agent runs once, in the core terminal. Attaching does not start a second process.
-- **Status lives with the owner.** The desktop Agents panel shows the real `idle` / `working` / `blocked` / `done` status because herdr-core sees the agent's OSC 7501 reports. The TUI tab shows `unknown` because its foreground process is `hc attach`, not the agent. This is expected and harmless.
-- **Lifecycle.** Closing the desktop window does not end the terminal. Restarting the TUI may leave the tab in place but drop the attach process; re-run `sync.ps1` or `hc attach` in that tab. If the core terminal dies, both views end; re-run `sync.ps1` to recreate it.
+- **No silent tab kills.** A live desktop tab is never closed unless `-Replace`
+  or `-Restart` was passed, or the terminal is provably back at a shell prompt.
+- **No remote temp script.** The TUI script travels over stdin, so there is no
+  `/tmp/herdr-sync-attach-$PID.sh` race on a shared machine.
+- **Duplicate-safe.** Extra same-label tabs are reused or reported, never
+  silently closed unless `--replace` asks for it.
+- **Replacement before close.** The new desktop tab is created before the stale
+  one is closed, so the space cannot disappear mid-run.
+- **Idempotent.** Re-running `sync.ps1` after a reboot reuses every healthy
+  piece and only repairs what is missing.
 
 ## Caveats
 
 - **This shares one terminal, not a whole tab.** Splits, extra panes and tab layout are not mirrored. Run the script once per agent terminal you want to share.
-- **Both sides can type.** There is no writer lock; herdr-core merges input from both clients. Use one side at a time for predictable results.
+- **Both sides can type.** `hc attach` has no writer lock; herdr-core merges input from both clients. Use one side at a time for predictable results.
 - **Resizes are shared.** A narrow TUI pane can reflow the agent's output. Widen the pane or the desktop window if the layout looks cramped.
 - **Codex needs `--no-daemon`.** Without it, Codex talks to a background app-server and the terminal is no longer the agent process, so status detection and attach semantics break.
 - **Agent-specific resume.** The shared terminal is a normal interactive agent. If it exits, the terminal returns to the shell; start the agent again or recreate the tab.
 - **`hc attach` detaches with `ctrl+\`.** That returns the TUI pane to its shell without killing the agent. Re-run `hc attach t1` to reconnect.
 - **Remote `PATH`.** If `hc` or `herdr` is not on the TUI shell's `PATH`, pass `-RemoteHc` / `-RemoteHerdr` (or edit `attach-tui.sh`'s defaults).
+- **Reverse adoption is not implemented.** A TUI tab that does not already run
+  `hc attach` owns its PTY inside the TUI server; that PTY cannot be handed to
+  herdr-core. The only safe reverse direction is a TUI tab that is already an
+  `hc attach` client, and the forward `sync.ps1` path is what creates those.
 
 ## Troubleshooting
 
@@ -216,12 +319,31 @@ See [docs/how-it-works.md](docs/how-it-works.md) for the longer version.
 | --- | --- |
 | `herdr-app: command not found` | Run the script from the desktop machine where the Herdr app is installed, or add its install folder to `PATH`. |
 | `Pass -Machine` | Run `hc machine ls` and pass a name from the list. |
-| `tab 'codex' exists but is not attached` | Re-run with `-ReplaceTuiTab`, or close that TUI tab manually and run again. |
+| `machine 'x' is not registered` | The name must match `hc machine ls`, not an SSH host alias. |
+| `attach-tui.sh failed ... (exit 3)` | A TUI tab with that label exists but is not attached. Re-run with `-ReplaceTuiTab` (or `--replace`). |
 | `herdr-core terminal not found: t1` | The core terminal died. Re-run `sync.ps1`; `setup-desktop.ps1` recreates a dead tab. |
+| `could not confirm agent 'x' ... keeping the live tab` | Expected for wrappers. Pass `-Restart` only if you really want to end the session. |
 | `jq: command not found` | Install jq on the remote: `sudo apt install jq` (Debian/Ubuntu) or the equivalent. |
 | TUI tab shows `unknown` status | Expected: the tab runs `hc attach`. Check the desktop Agents panel for the real status. |
 | Desktop shows `working` forever after the agent exits | The agent is not reporting OSC 7501. For Codex, confirm `--no-daemon`. |
+| `warning: could not focus tab` | `herdr tab focus` failed; the attach succeeded. Check the TUI server log/version. |
 | Attach works but typing in the TUI does nothing | Check that the TUI pane has keyboard focus and that `hc attach` is in the foreground (`herdr pane process-info`). |
+
+## Development
+
+```powershell
+# Shell tests (Git Bash, Linux or macOS; jq required)
+bash tests/run.sh
+
+# PowerShell unit tests
+pwsh -File tests/run.ps1
+
+# Lint
+shellcheck scripts/*.sh tests/*.sh tests/mocks/*
+Invoke-ScriptAnalyzer -Path scripts -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+```
+
+CI runs the same checks on Ubuntu and Windows.
 
 ## Possible upstream improvements
 

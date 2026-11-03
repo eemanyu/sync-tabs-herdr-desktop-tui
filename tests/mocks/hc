@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Minimal hc mock for attach-tui.sh tests.
+set -euo pipefail
+
+log=${MOCK_LOG:-/dev/null}
+
+{
+  printf 'hc'
+  printf ' %q' "$@"
+  printf '\n'
+} >>"$log"
+
+if [[ ${1:-} == get ]]; then
+  terminal=${2:-}
+  if [[ ${MOCK_TERMINAL_MISSING:-0} == 1 ]]; then
+    exit 1
+  fi
+  printf '{"address":"%s","state":"live","foreground":{"name":"bash","argv":["/bin/bash"]}}\n' "$terminal"
+  exit 0
+fi
+
+exit 0

@@ -5,4 +5,12 @@
 
 # PowerShell and Markdown read fine with LF on every platform.
 *.ps1 text eol=lf
+*.psm1 text eol=lf
+*.psd1 text eol=lf
 *.md text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+
+# Test mocks have no extension and must keep LF.
+.editorconfig text eol=lf
+tests/mocks/* text eol=lf.gitattributes text eol=lf

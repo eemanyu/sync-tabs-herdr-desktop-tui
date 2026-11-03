@@ -8,9 +8,15 @@
   space and tab exist on the given machine, starts the agent in the tab's
   herdr-core terminal, and reports the terminal address.
 
-  It is idempotent: an existing space, tab and live terminal are reused. If the
-  tab exists but its terminal is no longer live, or the terminal is live but the
-  agent is no longer running in it, the tab is recreated with the requested agent.
+  It is idempotent: an existing space, tab and live terminal are reused.
+
+  A live terminal is only recreated when:
+    - it is sitting at an interactive shell prompt (the agent exited), or
+    - -Replace was passed explicitly.
+
+  A live terminal running an unrecognized foreground process (npx, uv run,
+  node script.js) is kept and reported as a warning, because recreating it would
+  kill a session that may still be healthy.
 
 .PARAMETER Machine
   Machine name from `hc machine ls`. Required.
@@ -30,6 +36,16 @@
 .PARAMETER SelectDesktop
   Select the space in the desktop app after ensuring it exists.
 
+.PARAMETER Replace
+  Recreate a live tab even when the agent cannot be confirmed. This can end a
+  running agent session.
+
+.PARAMETER NoReplace
+  Never close or recreate an existing tab. Fail instead.
+
+.PARAMETER DryRun
+  Report what would happen without changing anything.
+
 .PARAMETER Json
   Emit one JSON object instead of human-readable output.
 
@@ -38,332 +54,410 @@
 
 .EXAMPLE
   pwsh -File scripts/setup-desktop.ps1 -Machine my-vps -Json
+
+.EXAMPLE
+  pwsh -File scripts/setup-desktop.ps1 -Machine my-vps -DryRun
 #>
 [CmdletBinding()]
 param(
-  [string]$Machine = "",
-  [string]$SpaceName = "agents",
-  [string]$TabName = "codex",
-  [string]$AgentArgv = "codex --no-daemon",
-  [string]$Folder = "",
-  [switch]$SelectDesktop,
-  [switch]$Json
+    [Parameter(Mandatory)]
+    [string]$Machine,
+
+    [string]$SpaceName = 'agents',
+    [string]$TabName = 'codex',
+    [string]$AgentArgv = 'codex --no-daemon',
+    [string]$Folder = '',
+    [switch]$SelectDesktop,
+    [switch]$Replace,
+    [switch]$NoReplace,
+    [switch]$DryRun,
+    [switch]$Json
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot 'lib/herdr-sync.psm1') -Force
 
-function Split-CommandLine {
-  param([string]$Line)
-
-  $result = [System.Collections.Generic.List[string]]::new()
-  $current = [System.Text.StringBuilder]::new()
-  $quote = [char]0
-  $hasToken = $false
-
-  foreach ($character in $Line.ToCharArray()) {
-    if ($quote -ne [char]0) {
-      if ($character -eq $quote) {
-        $quote = [char]0
-      } else {
-        [void]$current.Append($character)
-      }
-      $hasToken = $true
-    } elseif ($character -eq '"' -or $character -eq "'") {
-      $quote = $character
-      $hasToken = $true
-    } elseif ([char]::IsWhiteSpace($character) -or $character -eq ',') {
-      if ($hasToken) {
-        $result.Add($current.ToString())
-        [void]$current.Clear()
-        $hasToken = $false
-      }
-    } else {
-      [void]$current.Append($character)
-      $hasToken = $true
-    }
-  }
-
-  if ($quote -ne [char]0) {
-    throw "unterminated quote in agent command: $Line"
-  }
-  if ($hasToken) {
-    $result.Add($current.ToString())
-  }
-
-  return $result.ToArray()
+if ($Replace -and $NoReplace) {
+    throw '-Replace and -NoReplace cannot be used together.'
 }
 
 function Write-Info {
-  param([string]$Message)
-  if (-not $Json) { Write-Host $Message }
-}
-
-function Quote-WinArg {
-  param([string]$Value)
-  if ($Value -match '^[A-Za-z0-9_./:@%+=,-]+$') { return $Value }
-  return '"' + ($Value -replace '"', '\"') + '"'
-}
-
-function Invoke-HerdrApp {
-  param([string[]]$Arguments)
-
-  # herdr-app is a GUI-subsystem executable. Capturing it through a
-  # PowerShell pipeline can close the pipe before it finishes writing, so
-  # redirect to files and wait for the process instead.
-  $stdoutFile = [System.IO.Path]::GetTempFileName()
-  $stderrFile = [System.IO.Path]::GetTempFileName()
-
-  try {
-    $argumentLine = ($Arguments | ForEach-Object { Quote-WinArg $_ }) -join " "
-    $startArgs = @{
-      FilePath               = "herdr-app"
-      ArgumentList           = $argumentLine
-      RedirectStandardOutput = $stdoutFile
-      RedirectStandardError  = $stderrFile
-      Wait                   = $true
-      PassThru               = $true
+    param([string]$Message)
+    if (-not $Json) {
+        Write-Host $Message
     }
-    if ($IsWindows) { $startArgs["NoNewWindow"] = $true }
-
-    $process = Start-Process @startArgs
-    $stdout = Get-Content -Raw -LiteralPath $stdoutFile -ErrorAction SilentlyContinue
-    $stderr = Get-Content -Raw -LiteralPath $stderrFile -ErrorAction SilentlyContinue
-
-    if ($process.ExitCode -ne 0) {
-      throw "herdr-app $($Arguments -join ' ') failed (exit $($process.ExitCode)): $($stderr)$($stdout)"
-    }
-
-    return (("$stdout$stderr").Trim())
-  } finally {
-    Remove-Item -LiteralPath $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
-  }
 }
 
-function Get-HerdrState {
-  $raw = Invoke-HerdrApp @("ls")
-  if (-not $raw) { throw "herdr-app ls returned no output" }
-  return $raw | ConvertFrom-Json
+$script:warnings = [System.Collections.Generic.List[string]]::new()
+
+function Add-WarningMessage {
+    param([string]$Message)
+    $script:warnings.Add($Message)
+    Write-Warning $Message
 }
 
-function Find-Space {
-  param($State)
-  return $State.spaces |
-    Where-Object { $_.machine -eq $Machine -and $_.name -eq $SpaceName } |
-    Select-Object -First 1
-}
+function Get-SpaceTabs {
+    param([string]$SpaceId)
 
-function Find-Tab {
-  param($Space)
-  return $Space.tabs |
-    Where-Object { $_.name -eq $TabName } |
-    Select-Object -First 1
-}
-
-function Find-Tabs {
-  param($Space)
-  return @($Space.tabs | Where-Object { $_.name -eq $TabName })
-}
-
-function Get-CoreTerminal {
-  param([string]$Address)
-  $output = & hc get $Address --json 2>&1
-  if ($LASTEXITCODE -ne 0) { return $null }
-  try {
-    return ((($output | Out-String).Trim()) | ConvertFrom-Json)
-  } catch {
-    return $null
-  }
-}
-
-function Wait-CoreTerminal {
-  param([string]$SpaceId, [int]$TimeoutSeconds = 30)
-
-  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-  while ((Get-Date) -lt $deadline) {
     $state = Get-HerdrState
-    $space = Find-Space $state
-    if ($space -and $space.id -eq $SpaceId) {
-      foreach ($tab in (Find-Tabs $space)) {
-        foreach ($candidate in $tab.terminals) {
-          $live = Get-CoreTerminal $candidate.terminal
-          if ($live -and $live.state -eq "live") { return $live }
-        }
-      }
+    $space = @($state.spaces | Where-Object { $_.id -eq $SpaceId }) | Select-Object -First 1
+    if (-not $space) {
+        throw "desktop space '$SpaceId' disappeared while the script was running"
     }
-    Start-Sleep -Milliseconds 500
-  }
-
-  throw "the herdr-core terminal did not become live within $TimeoutSeconds seconds"
+    return @($space.tabs)
 }
 
-function Test-AgentRunning {
-  param([string]$Address, [string]$AgentName)
-  $core = Get-CoreTerminal $Address
-  if (-not $core) { return $false }
-  if ($core.foreground.name -eq $AgentName) { return $true }
-  if ($core.status -and $core.status.app -eq $AgentName) { return $true }
-  return $false
+function Get-FirstTerminalAddress {
+    param($Tab)
+    $terminal = @($Tab.terminals) | Select-Object -First 1
+    if ($terminal) {
+        return [string]$terminal.terminal
+    }
+    return ''
 }
 
-foreach ($binary in @("herdr-app", "hc")) {
-  if (-not (Get-Command $binary -ErrorAction SilentlyContinue)) {
-    throw "$binary was not found in PATH"
-  }
+function New-DesktopTab {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([string]$SpaceId, [string]$ArgvJson)
+
+    if (-not $PSCmdlet.ShouldProcess("space $SpaceId", "create desktop tab '$TabName'")) {
+        throw "creation of tab '$TabName' was cancelled"
+    }
+
+    $arguments = @('do', 'tab.new', '--space', $SpaceId, '--name', $TabName, '--argv', $ArgvJson)
+    if ($Folder) {
+        $arguments += @('--folder', $Folder)
+    }
+
+    $raw = Invoke-HerdrApp -Arguments $arguments
+    try {
+        $created = $raw | ConvertFrom-Json
+    } catch {
+        throw "tab.new returned invalid JSON: $raw"
+    }
+
+    if (-not $created.tab -or -not $created.terminal) {
+        throw "tab.new did not return a tab and terminal: $raw"
+    }
+
+    return $created
 }
 
-if (-not $Machine) {
-  throw "Pass -Machine with a name from ``hc machine ls``."
+function Close-DesktopTab {
+    param([string]$TabId)
+
+    $arguments = @('do', 'tab.close', '--id', $TabId, '--confirmed', 'true')
+    Invoke-HerdrApp -Arguments $arguments | Out-Null
 }
 
-$agentArgvList = @(Split-CommandLine $AgentArgv)
+function Wait-CoreTerminalLive {
+    param([string]$Address, [int]$TimeoutSeconds = 30)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $core = Get-CoreTerminal -Address $Address
+        if ($core -and $core.state -eq 'live') {
+            return $core
+        }
+        Start-Sleep -Milliseconds 400
+    } while ((Get-Date) -lt $deadline)
+
+    throw "herdr-core terminal '$Address' did not become live within $TimeoutSeconds seconds"
+}
+
+foreach ($binary in @('herdr-app', 'hc')) {
+    if (-not (Get-Command $binary -ErrorAction SilentlyContinue)) {
+        throw "$binary was not found in PATH"
+    }
+}
+
+# Fail early with the list of valid names instead of a herdr-app error later.
+$machineJson = (& hc machine ls --json 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw "hc machine ls failed: $machineJson"
+}
+try {
+    $registeredMachines = @((($machineJson | ConvertFrom-Json).machines) | ForEach-Object { [string]$_.name })
+} catch {
+    throw "hc machine ls returned invalid JSON: $machineJson"
+}
+if ($Machine -notin $registeredMachines) {
+    throw "machine '$Machine' is not registered. Known machines: $($registeredMachines -join ', ')"
+}
+
+$agentArgvList = @(Split-AgentCommandLine -Line $AgentArgv)
 if ($agentArgvList.Count -eq 0) {
-  throw "-AgentArgv is empty"
+    throw '-AgentArgv is empty'
 }
-$argvJson = ($agentArgvList | ConvertTo-Json -Compress -AsArray)
+$argvJson = ConvertTo-Json -InputObject $agentArgvList -Compress
 $agentName = [System.IO.Path]::GetFileNameWithoutExtension($agentArgvList[0])
 
 $state = Get-HerdrState
-$space = Find-Space $state
-$spaceId = $null
-$spaceWasCreated = $false
+$matchingSpaces = @($state.spaces | Where-Object { $_.machine -eq $Machine -and $_.name -eq $SpaceName })
+if ($matchingSpaces.Count -gt 1) {
+    Add-WarningMessage "more than one space is named '$SpaceName' on $Machine; using $($matchingSpaces[0].id)"
+}
+$space = $matchingSpaces | Select-Object -First 1
+
+$spaceId = ''
+$tabId = ''
+$terminalAddress = ''
+$action = 'reused'
+$agentConfirmed = $false
 
 if (-not $space) {
-  $arguments = @(
-    "do", "space.new",
-    "--machine", $Machine,
-    "--name", $SpaceName,
-    "--tab", $TabName,
-    "--argv", $argvJson
-  )
-  if ($Folder) { $arguments += @("--folder", $Folder) }
+    if ($DryRun) {
+        $result = [pscustomobject]@{
+            machine        = $Machine
+            space          = $null
+            tab            = $null
+            terminal       = $null
+            local_terminal = $null
+            state          = $null
+            agent          = $null
+            status         = $null
+            action         = 'would-create'
+            agent_confirmed = $false
+            dry_run        = $true
+            warnings       = @($script:warnings)
+        }
+        if ($Json) { $result | ConvertTo-Json -Compress -Depth 5 } else { Write-Host "Would create space '$SpaceName' and tab '$TabName'." }
+        return
+    }
 
-  Invoke-HerdrApp $arguments | Out-Null
-  $state = Get-HerdrState
-  $space = Find-Space $state
-  $spaceId = $space.id
-  $spaceWasCreated = $true
-  Write-Info "created space '$SpaceName' ($spaceId)"
+    $arguments = @(
+        'do', 'space.new',
+        '--machine', $Machine,
+        '--name', $SpaceName,
+        '--tab', $TabName,
+        '--argv', $argvJson
+    )
+    if ($Folder) {
+        $arguments += @('--folder', $Folder)
+    }
+
+    $raw = Invoke-HerdrApp -Arguments $arguments
+    try {
+        $created = $raw | ConvertFrom-Json
+    } catch {
+        throw "space.new returned invalid JSON: $raw"
+    }
+    if (-not $created.space -or -not $created.tab -or -not $created.terminal) {
+        throw "space.new did not return space, tab and terminal: $raw"
+    }
+
+    $spaceId = [string]$created.space
+    $tabId = [string]$created.tab
+    $terminalAddress = [string]$created.terminal
+    $action = 'created'
+    Write-Info "created space '$SpaceName' ($spaceId)"
 } else {
-  $spaceId = $space.id
-  Write-Info "reusing space '$SpaceName' ($spaceId)"
-}
+    $spaceId = [string]$space.id
+    Write-Info "reusing space '$SpaceName' ($spaceId)"
 
-# Re-read so the tab created by space.new is visible.
-$state = Get-HerdrState
-$space = Find-Space $state
-$tab = Find-Tab $space
-$needsReplacement = $false
-
-if ($tab -and -not $spaceWasCreated) {
-  $existingTerminal = $tab.terminals | Select-Object -First 1
-  $live = $null
-  if ($existingTerminal) {
-    $live = Get-CoreTerminal $existingTerminal.terminal
-  }
-
-  if ($live -and $live.state -eq "live") {
-    # Give an agent that is still starting a moment before replacing the tab.
-    $deadline = (Get-Date).AddSeconds(10)
-    while (-not (Test-AgentRunning $live.address $agentName) -and (Get-Date) -lt $deadline) {
-      Start-Sleep -Milliseconds 500
+    $matchingTabs = @($space.tabs | Where-Object { $_.name -eq $TabName })
+    $tabStates = foreach ($tab in $matchingTabs) {
+        $address = Get-FirstTerminalAddress -Tab $tab
+        $core = $null
+        if ($address) {
+            $core = Get-CoreTerminal -Address $address
+        }
+        [pscustomobject]@{
+            Tab     = $tab
+            Address = $address
+            Core    = $core
+        }
     }
 
-    if (Test-AgentRunning $live.address $agentName) {
-      Write-Info "reusing tab '$TabName' ($($tab.id)) -> $($live.address)"
+    $liveTabs = @($tabStates | Where-Object { $_.Core -and $_.Core.state -eq 'live' })
+    $chosen = $null
+    if ($liveTabs.Count -gt 0) {
+        $chosen = $liveTabs |
+            Where-Object { Test-AgentInTerminal -Core $_.Core -AgentName $agentName } |
+            Select-Object -First 1
+        if (-not $chosen) {
+            $chosen = $liveTabs[0]
+        }
+        if ($liveTabs.Count -gt 1) {
+            Add-WarningMessage "multiple live tabs are named '$TabName'; reusing $($chosen.Tab.id)"
+        }
+    }
+
+    if ($chosen) {
+        $tabId = [string]$chosen.Tab.id
+        $terminalAddress = [string]$chosen.Address
+
+        if (Test-AgentInTerminal -Core $chosen.Core -AgentName $agentName) {
+            $action = 'reused'
+            Write-Info "reusing tab '$TabName' ($tabId) -> $terminalAddress"
+        } elseif (Test-ShellForeground -Core $chosen.Core) {
+            if ($NoReplace) {
+                throw "tab '$TabName' is live but its agent is not running (shell prompt). Re-run without -NoReplace to restart it."
+            }
+            $action = 'replaced'
+            Write-Info "tab '$TabName' is live but '$agentName' is not running; restarting the agent"
+        } elseif ($Replace) {
+            $action = 'replaced'
+            Write-Info "tab '$TabName' is live but '$agentName' is not confirmed; recreating because -Replace was passed"
+        } else {
+            Add-WarningMessage ("could not confirm agent '$agentName' in $terminalAddress " +
+                "(foreground: '$($chosen.Core.foreground.name)'); keeping the live tab so a running " +
+                "session is not killed. Pass -Replace to restart it.")
+        }
+    } elseif ($tabStates.Count -gt 0) {
+        if ($NoReplace) {
+            throw "tab '$TabName' exists but its terminal is not live. Re-run without -NoReplace to replace it."
+        }
+        $action = 'replaced'
+        Write-Info "tab '$TabName' exists but its terminal is not live; replacing it"
     } else {
-      Write-Info "tab '$TabName' is live but '$agentName' is not running; recreating it"
-      $needsReplacement = $true
+        $action = 'created'
     }
-  } else {
-    Write-Info "tab '$TabName' exists but its terminal is not live; recreating it"
-    $needsReplacement = $true
-  }
+
+    if ($DryRun) {
+        $agentConfirmed = [bool]($chosen -and (Test-AgentInTerminal -Core $chosen.Core -AgentName $agentName))
+        $reportedAgent = $null
+        $reportedStatus = $null
+        if ($chosen -and $chosen.Core) {
+            if ($chosen.Core.status) {
+                $reportedAgent = [string]$chosen.Core.status.app
+                $reportedStatus = [string]$chosen.Core.status.state
+            }
+            if (-not $reportedAgent -and $chosen.Core.foreground) {
+                $reportedAgent = [string]$chosen.Core.foreground.name
+            }
+        }
+        $plannedAction = $action
+        if ($action -ne 'reused') {
+            $plannedAction = "would-$action"
+        }
+
+        $result = [pscustomobject]@{
+            machine         = $Machine
+            space           = $spaceId
+            tab             = if ($tabId) { $tabId } else { $null }
+            terminal        = if ($terminalAddress) { $terminalAddress } else { $null }
+            local_terminal  = if ($terminalAddress) { Get-LocalTerminalAddress -Address $terminalAddress -Machine $Machine } else { $null }
+            state           = if ($chosen) { [string]$chosen.Core.state } else { $null }
+            agent           = $reportedAgent
+            status          = $reportedStatus
+            action          = $plannedAction
+            agent_confirmed = $agentConfirmed
+            dry_run         = $true
+            warnings        = @($script:warnings)
+        }
+        if ($Json) {
+            $result | ConvertTo-Json -Compress -Depth 5
+        } else {
+            Write-Host "Would $action tab '$TabName' in space $spaceId."
+        }
+        return
+    }
+
+    if ($action -eq 'replaced') {
+        $created = New-DesktopTab -SpaceId $spaceId -ArgvJson $argvJson
+        $newTabId = [string]$created.tab
+        $terminalAddress = [string]$created.terminal
+
+        # Close every stale tab with this name, but never the replacement.
+        foreach ($candidate in $tabStates) {
+            if ([string]$candidate.Tab.id -eq $newTabId) {
+                continue
+            }
+            try {
+                Close-DesktopTab -TabId ([string]$candidate.Tab.id)
+            } catch {
+                Add-WarningMessage "could not close stale tab $($candidate.Tab.id): $($_.Exception.Message)"
+            }
+        }
+
+        $tabId = $newTabId
+        Write-Info "created replacement tab '$TabName' ($tabId)"
+    } elseif ($action -eq 'created') {
+        $created = New-DesktopTab -SpaceId $spaceId -ArgvJson $argvJson
+        $tabId = [string]$created.tab
+        $terminalAddress = [string]$created.terminal
+        Write-Info "created tab '$TabName' ($tabId)"
+    }
 }
 
-if (-not $tab -or $needsReplacement) {
-  $arguments = @(
-    "do", "tab.new",
-    "--space", $spaceId,
-    "--name", $TabName,
-    "--argv", $argvJson
-  )
-  if ($Folder) { $arguments += @("--folder", $Folder) }
+if (-not $terminalAddress) {
+    # space.new and tab.new both return the terminal; this is only a fallback.
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        $tabs = Get-SpaceTabs -SpaceId $spaceId
+        foreach ($candidate in $tabs) {
+            if ($candidate.name -ne $TabName) { continue }
+            $address = Get-FirstTerminalAddress -Tab $candidate
+            $core = Get-CoreTerminal -Address $address
+            if ($core -and $core.state -eq 'live') {
+                $terminalAddress = $address
+                $tabId = [string]$candidate.id
+                break
+            }
+        }
+        if ($terminalAddress) { break }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
 
-  Invoke-HerdrApp $arguments | Out-Null
-  Write-Info "created tab '$TabName'"
-
-  if ($tab) {
-    # Create the replacement first: closing the only tab of a space closes
-    # the space itself.
-    Invoke-HerdrApp @("do", "tab.close", "--id", $tab.id, "--confirmed", "true") | Out-Null
-  }
-
-  # Re-read so the replacement is found and the stale tab is gone.
-  $state = Get-HerdrState
-  $space = Find-Space $state
-  $tab = Find-Tab $space
+    if (-not $terminalAddress) {
+        throw "could not find a live desktop terminal for tab '$TabName' in space $spaceId"
+    }
 }
 
-$terminal = Wait-CoreTerminal -SpaceId $spaceId
+$core = Wait-CoreTerminalLive -Address $terminalAddress
 
-if (-not (Test-AgentRunning $terminal.address $agentName)) {
-  $deadline = (Get-Date).AddSeconds(20)
-  while (-not (Test-AgentRunning $terminal.address $agentName) -and (Get-Date) -lt $deadline) {
+$deadline = (Get-Date).AddSeconds(20)
+while (-not (Test-AgentInTerminal -Core $core -AgentName $agentName) -and (Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 500
-  }
-  if (-not (Test-AgentRunning $terminal.address $agentName)) {
-    Write-Warning "agent '$agentName' did not appear in $($terminal.address) within 20 seconds"
-  }
+    $core = Get-CoreTerminal -Address $terminalAddress
+}
+$agentConfirmed = [bool](Test-AgentInTerminal -Core $core -AgentName $agentName)
+if (-not $agentConfirmed) {
+    Add-WarningMessage "agent '$agentName' did not appear in $terminalAddress within 20 seconds"
 }
 
 if ($SelectDesktop) {
-  Invoke-HerdrApp @("do", "space.select", "--id", $spaceId) | Out-Null
+    Invoke-HerdrApp -Arguments @('do', 'space.select', '--id', $spaceId) | Out-Null
 }
 
-$state = Get-HerdrState
-$space = Find-Space $state
-$tab = $null
-$tabInfo = $null
-foreach ($candidateTab in $space.tabs) {
-  $candidateTerminal = $candidateTab.terminals |
-    Where-Object { $_.terminal -eq $terminal.address } |
-    Select-Object -First 1
-  if ($candidateTerminal) {
-    $tab = $candidateTab
-    $tabInfo = $candidateTerminal
-    break
-  }
+$tabEntry = $null
+foreach ($candidate in (Get-SpaceTabs -SpaceId $spaceId)) {
+    if ((Get-FirstTerminalAddress -Tab $candidate) -eq $terminalAddress) {
+        $tabEntry = @($candidate.terminals) | Select-Object -First 1
+        break
+    }
 }
-
-if (-not $tab) {
-  throw "could not find the desktop tab for terminal $($terminal.address)"
-}
-
-$localTerminal = $terminal.address -replace "^$([regex]::Escape($Machine))/", ""
 
 $result = [pscustomobject]@{
-  machine        = $Machine
-  space          = $space.id
-  tab            = $tab.id
-  terminal       = $terminal.address
-  local_terminal = $localTerminal
-  state          = $terminal.state
-  agent          = $tabInfo.app
-  status         = $tabInfo.status
+    machine         = $Machine
+    space           = $spaceId
+    tab             = $tabId
+    terminal        = $terminalAddress
+    local_terminal  = Get-LocalTerminalAddress -Address $terminalAddress -Machine $Machine
+    state           = [string]$core.state
+    agent           = if ($tabEntry) { [string]$tabEntry.app } else { $null }
+    status          = if ($tabEntry) { [string]$tabEntry.status } else { $null }
+    action          = $action
+    agent_confirmed = $agentConfirmed
+    warnings        = @($script:warnings)
 }
 
 if ($Json) {
-  $result | ConvertTo-Json -Compress
-  return
+    $result | ConvertTo-Json -Compress -Depth 5
+    return
 }
 
-Write-Host ""
-Write-Host "Desktop space : $SpaceName"
+Write-Host ''
+Write-Host "Desktop space : $SpaceName ($action)"
 Write-Host "Desktop tab   : $TabName"
 Write-Host "Space id      : $($result.space)"
 Write-Host "Tab id        : $($result.tab)"
 Write-Host "Terminal      : $($result.terminal) ($($result.state))"
 Write-Host "Local address : $($result.local_terminal)"
 Write-Host "Agent         : $($result.agent) / $($result.status)"
-Write-Host ""
+if ($script:warnings.Count -gt 0) {
+    Write-Host "Warnings      : $($script:warnings.Count) (see above)"
+}
+Write-Host ''
 Write-Host "Next: run scripts/attach-tui.sh $($result.local_terminal) $TabName on the remote machine."

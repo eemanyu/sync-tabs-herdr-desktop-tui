@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: Shell lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint shell scripts
+        run: shellcheck scripts/*.sh tests/*.sh tests/mocks/*
+
+      - name: Run mock-driven tests
+        run: bash tests/run.sh
+
+  powershell:
+    name: PowerShell lint and tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint PowerShell scripts
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          Invoke-ScriptAnalyzer -Path scripts -Recurse -Settings ./PSScriptAnalyzerSettings.psd1 -EnableExit
+
+      - name: Run Pester tests
+        shell: pwsh
+        run: |
+          Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck
+          & ./tests/run.ps1

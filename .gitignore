@@ -16,3 +16,6 @@ desktop.ini
 .env.*
 !.env.example
 herdr-shot*.png
+
+# Personal multi-target config
+sync.json

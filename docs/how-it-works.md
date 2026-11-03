@@ -93,46 +93,64 @@ The core terminal survives the desktop window because herdr-core owns it, not th
 
 - `space.new` when the space does not exist. It creates the space, its first tab and the core terminal in one step, and returns `{ space, tab, terminal }`.
 - `tab.new` when the space exists but the tab does not.
-- `tab.close` + `tab.new` when the tab exists but its terminal is no longer live. The replacement tab is created **before** the stale one is closed, because closing the last tab of a space closes the space.
-- `hc get <terminal> --json` to check that the terminal is live.
+- `tab.close` + `tab.new` when the tab exists but its terminal is no longer live, or when `-Replace`/`-Restart` asks for a restart. The replacement tab is created **before** the stale one is closed, because closing the last tab of a space closes the space.
+- `hc get <terminal> --json` to check that the terminal is live and to read its agent status.
 
 The script is idempotent: the space is found by `machine` + `name`, the tab by `name`, and a live terminal is reused.
+
+Reusing a live terminal is deliberate. The old script recreated the tab whenever `foreground.name` differed from the first word of `-AgentArgv`; a wrapper such as `npx`, `uv run` or `node script.js` therefore looked like a dead agent, and the script killed a healthy session. The current rules are:
+
+- agent reported over OSC 7501, or a matching foreground name/argv: reuse;
+- foreground is an interactive shell: the agent exited, restart it;
+- anything else: keep the terminal and warn; `-Replace` is required to restart it.
+
+`-NoReplace` turns every close into a hard error, and `-DryRun` reports the plan without changing anything.
+
 
 ### TUI side
 
 `scripts/attach-tui.sh` uses the TUI commands:
 
 - `herdr workspace list` to find the focused workspace, so the tab is created in the workspace the user is looking at.
-- `herdr tab list --workspace <id>` to find an existing tab by label.
-- `herdr pane process-info --pane <pane>` to check whether that tab's foreground process is already `hc attach <terminal>`.
-- `herdr tab create --label <label> --no-focus` to create the tab without stealing focus.
-- `herdr pane run <pane> "hc attach <terminal>"` to queue the attach command and Enter.
+- `herdr tab list --workspace <id>` to find existing tabs by label.
+- `herdr pane list` to map each tab to its pane.
+- `herdr pane process-info --pane <pane>` to check whether that pane's foreground process is already `hc attach <terminal>` (also `--observe`). The check reads the process `argv` array, not a regex over `cmdline`, so `t1` cannot match `t10` and paths with spaces work.
+- `herdr tab create --label <label> --no-focus` (`--focus` when `--focus` is passed) to create the tab.
+- `herdr pane run <pane> "<quoted hc> attach <quoted terminal>"` to queue the attach command and Enter. The paths are shell-quoted, so spaces in `hc` paths are safe.
+- `herdr tab focus <tab_id>` when focus was requested. This is the real command; `herdr tab select` does not exist.
 
 `pane run` is used instead of typing into the pane because it submits the command and Enter atomically. The script still retries briefly, in case the shell is not ready yet, and then polls `pane process-info` until the attach process appears.
 
-If a tab with the right label exists but is not attached, the script stops with an error unless `--replace` is passed. That avoids silently closing a tab that someone is using for something else.
+If tabs with the right label exist but are not attached, the script stops with exit code 3 unless `--replace` is passed. It never closes a tab that someone is using for something else. Duplicate attached tabs are reported and the first one is reused; stale duplicates are only closed with `--replace`.
 
 ### Sync side
 
 `scripts/sync.ps1`:
 
-1. Runs `setup-desktop.ps1` and gets the terminal address.
-2. Copies `attach-tui.sh` to `/tmp` on the remote with `hc file write`.
-3. Runs it with `hc exec --on <machine>`.
-4. Parses `TAB`, `PANE`, `HC`, `HERDR` and `REUSED`.
-5. Checks that the core terminal is still live.
-6. Optionally compares a sample of the desktop terminal's text with the TUI pane's text.
+1. Runs `setup-desktop.ps1` with `-Json` and gets the terminal address.
+2. Streams `attach-tui.sh` to the remote over stdin:
+   `hc exec -i --on <machine> "tr -d '\r' | bash -s -- <quoted args>"`. There is no predictable `/tmp` file on the remote and no separate `hc file write` step.
+3. Runs the script with `--json` and parses that JSON (the older `KEY=VALUE` output is still understood).
+4. Checks that the core terminal is still live.
+5. Optionally compares a sample of the desktop terminal's text with the TUI pane's text.
 
-The content comparison looks for a shared non-trivial line, not a byte-for-byte match. The two panes usually have different widths, so the same output wraps differently. A shared line plus the `hc attach` foreground process is enough to confirm that both views are on the same terminal.
+The content comparison normalizes whitespace, drops lines shorter than four characters, and looks for the longest shared line. The two panes usually have different widths, so the same output wraps differently. A shared line plus the live terminal and the `hc attach` argv is enough to confirm that both views are on the same terminal. When no identical line is found, the script says so rather than reporting success.
+
+`-DryRun` runs the same planning code without creating or closing anything.
 
 ## Limits
 
 - **One terminal, not one tab.** Splits, extra panes, zoom and tab layout are not mirrored. Run the script once per terminal you want to share.
-- **No writer lock.** Both clients can type at the same time; the PTY merges the input. Use one side at a time for predictable results.
+- **No writer lock.** Both clients can type at the same time; the PTY merges the input. `hc attach` in hc 0.1.17 has no takeover flag, so there is no arbitration to configure. Use one side at a time for predictable results.
 - **Shared resize.** A resize from either client changes the PTY size, so the other view may reflow.
 - **Agent-specific behavior.** Codex needs `--no-daemon`. Agents that do not report OSC 7501 will not show a status.
 - **TUI status is `unknown`.** The TUI sees the attach client, not the agent. The desktop Agents panel is the source of truth.
+- **Verification is heuristic.** The screen comparison looks for a shared normalized line; it proves that both views show the same terminal, not that every pixel matches. The live terminal check and the `hc attach` argv check are exact.
+- **Reverse adoption is not possible.** A TUI tab that does not already run `hc attach` owns its PTY inside the TUI server; that PTY cannot be handed to herdr-core. A TUI tab that is already an `hc attach` client is exactly what `sync.ps1` creates and reuses.
 - **Socket access is trust.** Anyone who can reach the herdr-core socket can attach to its terminals. Use `--observe` when you only need to watch, and rely on the operating system's user permissions for the socket.
+
+Version note: the behavior above was verified on 2026-11-02 with herdr 0.9.5, hc 0.1.17 and herdr-app 0.1.12. `herdr tab focus`, `hc attach --observe`, `space.new`, `tab.new`, `tab.close --confirmed true`, `space.select --id`, `herdr-app ls` and `hc machine ls --json` were exercised directly; the JSON field names used by the scripts come from those runs.
+
 
 ## A native API?
 

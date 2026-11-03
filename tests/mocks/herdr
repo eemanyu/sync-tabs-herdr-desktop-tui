@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# Minimal herdr mock for attach-tui.sh tests. State lives under $MOCK_STATE.
+set -euo pipefail
+
+state=${MOCK_STATE:?MOCK_STATE is required}
+log=${MOCK_LOG:-/dev/null}
+
+{
+  printf 'herdr'
+  printf ' %q' "$@"
+  printf '\n'
+} >>"$log"
+
+command_name=${1:-}
+shift || true
+
+case $command_name in
+  workspace)
+    sub=${1:-}
+    shift || true
+    [[ $sub == list ]] || exit 1
+    printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w1","label":"~","focused":true}]}}'
+    ;;
+  tab)
+    sub=${1:-}
+    shift || true
+    case $sub in
+      list)
+        jq -c '{result:{tabs:.}}' "$state/tabs.json"
+        ;;
+      create)
+        label=''
+        while (( $# )); do
+          case $1 in
+            --label)
+              label=${2:-}
+              shift 2
+              ;;
+            --workspace|--cwd|--env)
+              shift 2
+              ;;
+            --focus|--no-focus)
+              shift
+              ;;
+            *)
+              shift
+              ;;
+          esac
+        done
+        count=$(jq 'length' "$state/tabs.json")
+        number=$((count + 1))
+        tab_id="w1:t$number"
+        pane_id="w1:p$number"
+        jq --arg tab "$tab_id" --arg label "$label" \
+          '. + [{tab_id:$tab,label:$label,focused:false,workspace_id:"w1"}]' \
+          "$state/tabs.json" >"$state/tabs.tmp"
+        mv "$state/tabs.tmp" "$state/tabs.json"
+        jq --arg tab "$tab_id" --arg pane "$pane_id" \
+          '. + [{tab_id:$tab,pane_id:$pane,workspace_id:"w1"}]' \
+          "$state/panes.json" >"$state/panes.tmp"
+        mv "$state/panes.tmp" "$state/panes.json"
+        printf '{"result":{"tab":{"tab_id":"%s"},"root_pane":{"pane_id":"%s"}}}\n' "$tab_id" "$pane_id"
+        ;;
+      close)
+        tab_id=${1:-}
+        [[ -n $tab_id ]] || exit 1
+        jq --arg tab "$tab_id" 'map(select(.tab_id != $tab))' "$state/tabs.json" >"$state/tabs.tmp"
+        mv "$state/tabs.tmp" "$state/tabs.json"
+        jq --arg tab "$tab_id" 'map(select(.tab_id != $tab))' "$state/panes.json" >"$state/panes.tmp"
+        mv "$state/panes.tmp" "$state/panes.json"
+        printf '{"result":{"type":"ok"}}\n'
+        ;;
+      focus)
+        [[ ${MOCK_FOCUS_FAIL:-0} == 1 ]] && exit 1
+        printf '{"result":{"tab":{"tab_id":"%s","focused":true}}}\n' "${1:-}"
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+    ;;
+  pane)
+    sub=${1:-}
+    shift || true
+    case $sub in
+      list)
+        jq -c '{result:{panes:.}}' "$state/panes.json"
+        ;;
+      run)
+        pane_id=${1:-}
+        shift || true
+        command=${1:-}
+        printf '%s\n' "$command" >"$state/last-run"
+
+        terminal=''
+        read -r -a words <<<"$command"
+        if (( ${#words[@]} > 0 )); then
+          terminal=${words[${#words[@]}-1]}
+        fi
+
+        if [[ $command == *--observe* ]]; then
+          jq --arg pane "$pane_id" --arg terminal "$terminal" \
+            '.[$pane] = {argv:["/mock/hc","attach","--observe",$terminal]}' \
+            "$state/proc.json" >"$state/proc.tmp"
+        else
+          jq --arg pane "$pane_id" --arg terminal "$terminal" \
+            '.[$pane] = {argv:["/mock/hc","attach",$terminal]}' \
+            "$state/proc.json" >"$state/proc.tmp"
+        fi
+        mv "$state/proc.tmp" "$state/proc.json"
+        printf '{"result":{"type":"ok"}}\n'
+        ;;
+      process-info)
+        pane_id=''
+        while (( $# )); do
+          case $1 in
+            --pane)
+              pane_id=${2:-}
+              shift 2
+              ;;
+            --current)
+              shift
+              ;;
+            *)
+              shift
+              ;;
+          esac
+        done
+        [[ -n $pane_id ]] || exit 1
+        jq -c --arg pane "$pane_id" '
+          (.[$pane].argv // ["/bin/bash"]) as $argv
+          | {result:{process_info:{pane_id:$pane,foreground_processes:[{
+              name: ($argv[0] | split("/") | last),
+              argv: $argv,
+              cmdline: ($argv | join(" "))
+            }]}}}
+        ' "$state/proc.json"
+        ;;
+      read)
+        printf 'mock pane screen\n'
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    exit 1
+    ;;
+esac
