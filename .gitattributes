@@ -1,0 +1,8 @@
+* text=auto
+
+# Shell scripts must keep LF so they run on Linux.
+*.sh text eol=lf
+
+# PowerShell and Markdown read fine with LF on every platform.
+*.ps1 text eol=lf
+*.md text eol=lf
