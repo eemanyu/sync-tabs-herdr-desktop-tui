@@ -11,6 +11,9 @@
   The first run creates everything. Later runs reuse the existing space, tab,
   core terminal and TUI tab, so it is safe to run after a restart.
 
+  -Adopt (or -Watch) switches to the other direction: every TUI tab on the
+  machine is mirrored into a desktop space as a `herdr terminal attach` viewer.
+
   The TUI side is sent over stdin (`hc exec -i ... bash -s --`), so no
   predictable temporary file is written on the remote machine.
 
@@ -63,6 +66,21 @@
 .PARAMETER All
   Run every target in ./sync.json.
 
+.PARAMETER Adopt
+  Mirror every TUI tab of -Machine into the desktop (TUI -> desktop), then exit.
+
+.PARAMETER Watch
+  With -Adopt, keep scanning and adopt new TUI tabs as they appear.
+
+.PARAMETER AdoptSpace
+  Desktop space that holds the mirrored tabs. Default: "<machine> TUI".
+
+.PARAMETER AdoptIntervalSeconds
+  Watch poll interval. Default: 15.
+
+.PARAMETER Prune
+  With -Adopt, close viewer tabs whose TUI terminal no longer exists.
+
 .PARAMETER DryRun
   Show what would happen without changing anything.
 
@@ -77,6 +95,12 @@
 
 .EXAMPLE
   pwsh -File scripts/sync.ps1 -All -Config ./sync.json
+
+.EXAMPLE
+  pwsh -File scripts/sync.ps1 -Machine my-vps -Adopt
+
+.EXAMPLE
+  pwsh -File scripts/sync.ps1 -Machine my-vps -Watch -Prune
 #>
 [CmdletBinding()]
 param(
@@ -96,12 +120,39 @@ param(
     [string]$Config = '',
     [string]$Target = '',
     [switch]$All,
+    [switch]$Adopt,
+    [switch]$Watch,
+    [int]$AdoptIntervalSeconds = 15,
+    [string]$AdoptSpace = '',
+    [switch]$Prune,
     [switch]$DryRun,
     [switch]$Json
 )
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'lib/herdr-sync.psm1') -Force
+
+if ($Adopt -or $Watch) {
+    if (-not $Machine) {
+        throw 'Pass -Machine with a name from `hc machine ls` to adopt TUI tabs.'
+    }
+    $adoptArguments = @{
+        Machine         = $Machine
+        Watch           = [bool]$Watch
+        IntervalSeconds = $AdoptIntervalSeconds
+        Prune           = [bool]$Prune
+        DryRun          = [bool]$DryRun
+        Json            = [bool]$Json
+    }
+    if ($AdoptSpace) {
+        $adoptArguments['SpaceName'] = $AdoptSpace
+    }
+    if ($RemoteHerdr) {
+        $adoptArguments['RemoteHerdr'] = $RemoteHerdr
+    }
+    & (Join-Path $PSScriptRoot 'adopt-tui.ps1') @adoptArguments
+    exit $LASTEXITCODE
+}
 
 function Get-ConfigValue {
     param($Object, [string]$Name, $Default)

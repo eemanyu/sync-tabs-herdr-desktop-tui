@@ -138,6 +138,50 @@ The content comparison normalizes whitespace, drops lines shorter than four char
 
 `-DryRun` runs the same planning code without creating or closing anything.
 
+## Mirroring TUI tabs into the desktop
+
+The forward path (desktop → TUI) works because herdr-core owns the PTY and the
+TUI tab is just an `hc attach` client. The other direction starts from a TUI tab
+whose PTY is owned by the TUI server: the desktop cannot point at that PTY
+directly.
+
+Herdr exposes a bridge for exactly this: `herdr terminal attach <terminal_id>`.
+It is a terminal client for a pane's stream, so running it inside a herdr-core
+terminal gives the desktop a live, interactive view of the TUI pane:
+
+```
+TUI pane (PTY owned by the TUI server)
+        ▲
+        │  stream + input
+        │
+herdr terminal attach term_xxx
+        ▲
+        │  normal herdr-core terminal
+        │
+desktop tab (space "<machine> TUI")
+```
+
+`scripts/adopt-tui.ps1` uses `hc exec` to read `herdr tab list`, `herdr pane
+list` and `herdr pane process-info` on the machine, then creates one desktop tab
+per TUI tab with that command as its argv. It skips tabs that are already
+`hc attach` clients, because those are the forward path's tabs and already have
+a core owner.
+
+Consequences worth knowing:
+
+- Only the first pane of a TUI tab is mirrored.
+- The viewer is another terminal client, so its size participates in the
+  pane's shared size. Opening it can reflow the TUI pane.
+- The desktop tab's foreground process is `herdr`, so the desktop Agents panel
+  cannot classify it as an agent; the TUI keeps the real status.
+- Closing the viewer only ends the client; the TUI tab and its agent keep
+  running.
+- Re-runs match viewers by `terminal_id`, so they are idempotent. `-Watch`
+  polls and `-Prune` removes viewers whose TUI terminal is gone.
+
+This is a viewer, not a PTY migration. There is no public API to move a TUI
+pane into herdr-core.
+
 ## Limits
 
 - **One terminal, not one tab.** Splits, extra panes, zoom and tab layout are not mirrored. Run the script once per terminal you want to share.
@@ -146,7 +190,7 @@ The content comparison normalizes whitespace, drops lines shorter than four char
 - **Agent-specific behavior.** Codex needs `--no-daemon`. Agents that do not report OSC 7501 will not show a status.
 - **TUI status is `unknown`.** The TUI sees the attach client, not the agent. The desktop Agents panel is the source of truth.
 - **Verification is heuristic.** The screen comparison looks for a shared normalized line; it proves that both views show the same terminal, not that every pixel matches. The live terminal check and the `hc attach` argv check are exact.
-- **Reverse adoption is not possible.** A TUI tab that does not already run `hc attach` owns its PTY inside the TUI server; that PTY cannot be handed to herdr-core. A TUI tab that is already an `hc attach` client is exactly what `sync.ps1` creates and reuses.
+- **Direct adoption is not possible.** A TUI tab that does not already run `hc attach` owns its PTY inside the TUI server; that PTY cannot be handed to herdr-core. `adopt-tui.ps1` bridges it with `herdr terminal attach`, which gives the desktop a live viewer but leaves the PTY owner as the TUI server.
 - **Socket access is trust.** Anyone who can reach the herdr-core socket can attach to its terminals. Use `--observe` when you only need to watch, and rely on the operating system's user permissions for the socket.
 
 Version note: the behavior above was verified on 2026-11-02 with herdr 0.9.5, hc 0.1.17 and herdr-app 0.1.12. `herdr tab focus`, `hc attach --observe`, `space.new`, `tab.new`, `tab.close --confirmed true`, `space.select --id`, `herdr-app ls` and `hc machine ls --json` were exercised directly; the JSON field names used by the scripts come from those runs.

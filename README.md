@@ -2,7 +2,10 @@
 
 Share **one live agent terminal** between the [Herdr](https://herdr.dev) desktop app and the Herdr TUI.
 
-The desktop app and the TUI keep separate terminal registries: the desktop app owns terminals in **herdr-core** (`hc`), while the TUI server owns its own PTYs. There is no built-in "mirror this tab" command. This repo closes that gap by making herdr-core the single owner of the agent process and turning the TUI tab into an `hc attach` client of that terminal.
+The desktop app and the TUI keep separate terminal registries: the desktop app owns terminals in **herdr-core** (`hc`), while the TUI server owns its own PTYs. There is no built-in "mirror this tab" command. This repo closes that gap in both directions:
+
+- **Desktop → TUI:** make herdr-core the single owner of the agent process and turn the TUI tab into an `hc attach` client of that terminal (one agent process, two windows).
+- **TUI → desktop:** attach a herdr-core terminal to an existing TUI pane with `herdr terminal attach`, so every TUI tab can also appear in the desktop (see [Mirror every TUI tab](#mirror-every-tui-tab-in-the-desktop-tui--desktop)).
 
 The result is one agent process, two windows, identical input and output.
 
@@ -92,6 +95,11 @@ pwsh -File scripts/sync.ps1 `
 | `-Config` | Path to a `sync.json` with defaults and targets. |
 | `-Target` | With `-Config`, run only the target with this name. |
 | `-All` | Run every target in `./sync.json`. |
+| `-Adopt` | Mirror every TUI tab into the desktop (see below). |
+| `-Watch` | With `-Adopt`, keep scanning and adopt new TUI tabs. |
+| `-AdoptSpace` | Desktop space for mirrored tabs. Default: `<machine> TUI`. |
+| `-AdoptIntervalSeconds` | Watch poll interval. Default: 15. |
+| `-Prune` | With `-Adopt`, close viewers whose TUI tab is gone. |
 | `-DryRun` | Show what would happen without changing anything. |
 | `-Json` | Emit JSON (one object per target). |
 
@@ -130,6 +138,64 @@ pwsh -File scripts/sync.ps1 -All -Target claude
 Targets inherit `defaults` and override any key. Run one target with `-Target`.
 Each target is attempted even if a previous one fails; the exit code is `1` if
 any target failed. `-DryRun -All` is a safe way to check a config.
+
+## Mirror every TUI tab in the desktop (TUI → desktop)
+
+The desktop app only shows terminals owned by herdr-core. A TUI tab owns its PTY
+inside the TUI server, so the public bridge is `herdr terminal attach
+<terminal_id>`: it attaches a herdr-core terminal to the TUI pane's stream, live
+and interactive.
+
+`scripts/adopt-tui.ps1` scans the TUI on `-Machine` and creates one desktop tab
+per TUI tab in a dedicated space (default `<machine> TUI`):
+
+```powershell
+pwsh -File scripts/adopt-tui.ps1 -Machine my-vps
+```
+
+- Skips tabs that are already `hc attach` clients (the normal `sync.ps1` path).
+- Reuses viewer tabs on later runs, matched by the pane's terminal id.
+- `-Watch -Prune` keeps watching: new TUI tabs appear automatically, closed ones
+  are removed.
+
+```powershell
+pwsh -File scripts/adopt-tui.ps1 -Machine my-vps -Watch -Prune
+```
+
+The same switches are available on `sync.ps1`:
+
+```powershell
+pwsh -File scripts/sync.ps1 -Machine my-vps -Adopt
+pwsh -File scripts/sync.ps1 -Machine my-vps -Watch -Prune
+```
+
+| Option | Meaning |
+| --- | --- |
+| `-Machine` | Machine name from `hc machine ls` (required). |
+| `-SpaceName` | Desktop space for the mirrored tabs. Default: `<machine> TUI`. |
+| `-RemoteHerdr` | Absolute path to `herdr` on the remote, when it is not on the login shell `PATH`. |
+| `-Watch` | Poll and adopt new TUI tabs as they appear. |
+| `-IntervalSeconds` | Poll interval. Default: 15. |
+| `-Prune` | Close viewer tabs whose TUI terminal no longer exists. |
+| `-DryRun` | List what would be adopted without creating anything. |
+| `-Json` | Emit JSON. |
+
+What to expect:
+
+- The first pane of each TUI tab is mirrored; extra splits inside that tab are
+  not.
+- The viewer is a real terminal client: typing in the desktop tab reaches the
+  TUI pane and its agent.
+- Terminal size is shared. Opening a viewer can reflow the TUI pane to the
+  desktop pane's size; close the viewer (or resize the desktop pane) if that
+  bothers you.
+- The desktop Agents panel sees `herdr`, so a mirrored tab's status is
+  `unknown`; the TUI still owns the real agent status.
+- Closing the viewer does not close the TUI tab or kill the agent.
+
+Why not show the TUI tab directly? Its PTY lives in the TUI server, not in
+herdr-core, and there is no public "adopt this pane" API. `herdr terminal attach`
+is the public bridge.
 
 ## Manual setup
 
@@ -202,6 +268,7 @@ Type in either window. Both should show the same draft and the same responses.
 │   ├── lib/herdr-sync.psm1  # shared parsing/quoting/verification helpers
 │   ├── setup-desktop.ps1    # create/reuse the desktop space, tab and core terminal
 │   ├── attach-tui.sh        # run on the remote: create the TUI tab and hc attach
+│   ├── adopt-tui.ps1        # mirror TUI tabs into the desktop (TUI -> desktop)
 │   └── sync.ps1             # orchestrate both sides and verify
 └── tests/
     ├── attach-tui.test.sh   # mock-driven shell tests
@@ -268,6 +335,23 @@ Runs **on the machine that hosts the TUI**. Creates a tab and attaches it to a c
 - Exit codes: `0` attached, `1` command failure, `2` usage error, `3` a
   same-label tab exists but is not attached (pass `--replace`).
 
+### `scripts/adopt-tui.ps1`
+
+Scans the TUI tabs on a machine and mirrors them into a desktop space. This is
+the TUI → desktop direction: each viewer tab runs `herdr terminal attach
+<terminal_id>` on the remote machine, in a herdr-core terminal.
+
+- Skips tabs whose pane is already an `hc attach` client.
+- Matches existing viewers by terminal id, so re-runs are idempotent.
+- `-Watch` polls and adopts new tabs; `-Prune` closes viewers whose TUI tab is
+  gone.
+- `-DryRun` and `-Json` are available.
+
+```powershell
+pwsh -File scripts/adopt-tui.ps1 -Machine my-vps
+pwsh -File scripts/adopt-tui.ps1 -Machine my-vps -Watch -Prune
+```
+
 ### `scripts/sync.ps1`
 
 The one-command entry point. Calls `setup-desktop.ps1`, streams `attach-tui.sh`
@@ -308,10 +392,15 @@ The verification is intentionally conservative:
 - **Agent-specific resume.** The shared terminal is a normal interactive agent. If it exits, the terminal returns to the shell; start the agent again or recreate the tab.
 - **`hc attach` detaches with `ctrl+\`.** That returns the TUI pane to its shell without killing the agent. Re-run `hc attach t1` to reconnect.
 - **Remote `PATH`.** If `hc` or `herdr` is not on the TUI shell's `PATH`, pass `-RemoteHc` / `-RemoteHerdr` (or edit `attach-tui.sh`'s defaults).
-- **Reverse adoption is not implemented.** A TUI tab that does not already run
+- **Direct adoption is not possible.** A TUI tab that does not already run
   `hc attach` owns its PTY inside the TUI server; that PTY cannot be handed to
-  herdr-core. The only safe reverse direction is a TUI tab that is already an
-  `hc attach` client, and the forward `sync.ps1` path is what creates those.
+  herdr-core. `adopt-tui.ps1` bridges it with `herdr terminal attach` instead:
+  the desktop gets a live viewer, but the PTY owner stays the TUI server.
+- **TUI → desktop viewers share the pane size.** A viewer created by
+  `adopt-tui.ps1` is another terminal client of the TUI pane, so it can reflow
+  the TUI pane while it is open. Close the viewer if the TUI layout gets
+  cramped. Its status is `unknown` in the desktop Agents panel because the
+  foreground process is `herdr`, not the agent.
 
 ## Troubleshooting
 
@@ -327,6 +416,9 @@ The verification is intentionally conservative:
 | TUI tab shows `unknown` status | Expected: the tab runs `hc attach`. Check the desktop Agents panel for the real status. |
 | Desktop shows `working` forever after the agent exits | The agent is not reporting OSC 7501. For Codex, confirm `--no-daemon`. |
 | `warning: could not focus tab` | `herdr tab focus` failed; the attach succeeded. Check the TUI server log/version. |
+| Mirrored TUI tab shows a shell and `bash: : command not found` | The viewer could not find `herdr` on the remote. Pass `-RemoteHerdr /home/you/.local/bin/herdr`. |
+| New TUI tabs do not appear | Run `scripts/adopt-tui.ps1 -Machine <name>` again, or keep `-Watch -Prune` running. |
+| Mirrored tab status is `unknown` | Expected: the desktop sees `herdr terminal attach`, not the agent. |
 | Attach works but typing in the TUI does nothing | Check that the TUI pane has keyboard focus and that `hc attach` is in the foreground (`herdr pane process-info`). |
 
 ## Development

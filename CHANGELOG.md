@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0 - 2026-11-03
+
+### Added
+
+- **TUI → desktop mirroring.** `scripts/adopt-tui.ps1` scans the TUI tabs on a
+  machine and creates one desktop tab per tab in a dedicated space (`<machine>
+  TUI`). Each viewer runs `herdr terminal attach <terminal_id>`, which is a
+  live, interactive client of the TUI pane's stream.
+  - Skips tabs that are already `hc attach` clients (the forward path).
+  - Matches existing viewers by terminal id, so re-runs are idempotent.
+  - `-Watch` polls and adopts new TUI tabs automatically; `-Prune` removes
+    viewers whose TUI terminal no longer exists.
+  - Available as `sync.ps1 -Adopt`, `-Watch`, `-AdoptSpace`,
+    `-AdoptIntervalSeconds` and `-Prune`.
+  - Verified against a real VPS: all 7 non-forwarded TUI tabs appeared in the
+    desktop, a new TUI tab was adopted by `-Watch`, and closing the TUI tab was
+    pruned by `-Watch -Prune`.
+
+### Changed
+
+- README and `docs/how-it-works.md` explain the two directions and the
+  viewer's limits (shared pane size, `unknown` status, first pane only).
+
 ## 0.2.0 - 2026-11-02
 
 ### Fixed
