@@ -448,6 +448,18 @@ This repo is a workaround for a missing primitive. A native version in Herdr cou
 
 Until then, the scripts here do the same thing with the public `herdr` and `hc` commands.
 
+## Related projects
+
+- **[Ovis](https://github.com/devswha/ovis)** (formerly herdr web UI) is a browser and phone
+  client for Herdr: it lists every workspace, tab and pane, including remote PCs over SSH,
+  and opens a live terminal with `herdr terminal attach` — the same primitive
+  `adopt-tui.ps1` uses. It is complementary, not a replacement: it does not put TUI tabs
+  inside the Herdr desktop app, and it serves one runtime per instance (the TUI server, or
+  the desktop app's herdr-core with `OVIS_RUNTIME=herdr-core`). If you run Ovis and
+  `adopt-tui.ps1 -Watch` against the same panes, they become two terminal clients of the
+  same pane; Ovis's "Open here" can take the pane with `--takeover`, and a standalone
+  `herdr terminal attach` may exit. Stop the watcher if you switch to Ovis.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
